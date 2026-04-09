@@ -6,5 +6,12 @@
   "assets": {
     "directory": ".open-next/assets",
     "binding": "ASSETS"
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mango-signaling",
+      "database_id": "4d9d8bc2-8658-4f17-b2b1-ef680e651589"
+    }
+  ]
 }

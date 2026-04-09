@@ -1,143 +1,110 @@
 /**
- * Signaling server using Server-Sent Events (SSE) for WebRTC negotiation.
+ * Signaling server using D1 database + HTTP polling for WebRTC negotiation.
  *
- * GET  - Subscribe to room events (SSE)
- * POST - Send a signal message to room peers
+ * GET  - Poll for new messages and participants
+ * POST - Send a signal message or heartbeat
  */
 
-type Client = {
-  peerId: string;
-  name: string;
-  controller: ReadableStreamDefaultController;
-};
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
-// In-memory room state (for single-server deployment)
-const rooms = new Map<string, Map<string, Client>>();
+export const runtime = "edge";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const roomId = url.searchParams.get("roomId");
   const peerId = url.searchParams.get("peerId");
-  const name = url.searchParams.get("name") || "Guest";
+  const afterId = url.searchParams.get("afterId") || "0";
 
   if (!roomId || !peerId) {
-    return new Response("Missing roomId or peerId", { status: 400 });
+    return Response.json({ error: "Missing roomId or peerId" }, { status: 400 });
   }
 
-  const stream = new ReadableStream({
-    start(controller) {
-      // Get or create room
-      if (!rooms.has(roomId)) {
-        rooms.set(roomId, new Map());
-      }
-      const room = rooms.get(roomId)!;
+  const { env } = await getCloudflareContext();
+  const db = (env as Record<string, unknown>).DB as D1Database;
 
-      // Notify existing peers about the new joiner
-      for (const [existingPeerId, client] of room) {
-        try {
-          const msg = JSON.stringify({
-            type: "peer-joined",
-            peerId,
-            name,
-          });
-          client.controller.enqueue(`data: ${msg}\n\n`);
-        } catch {
-          room.delete(existingPeerId);
-        }
-      }
+  // Get messages for this peer (broadcast or directed to them)
+  const messages = await db
+    .prepare(
+      `SELECT id, from_peer, to_peer, type, payload, created_at
+       FROM messages
+       WHERE room_id = ? AND id > ? AND from_peer != ?
+         AND (to_peer IS NULL OR to_peer = ?)
+       ORDER BY id ASC
+       LIMIT 50`
+    )
+    .bind(roomId, afterId, peerId, peerId)
+    .all();
 
-      // Add new client to room
-      room.set(peerId, { peerId, name, controller });
+  // Get active participants (seen within last 15 seconds)
+  const now = Math.floor(Date.now() / 1000);
+  const participants = await db
+    .prepare(
+      `SELECT peer_id, name FROM participants
+       WHERE room_id = ? AND last_seen > ? AND peer_id != ?`
+    )
+    .bind(roomId, now - 15, peerId)
+    .all();
 
-      // Send existing peers info to the new joiner
-      for (const [existingPeerId, client] of room) {
-        if (existingPeerId !== peerId) {
-          try {
-            const msg = JSON.stringify({
-              type: "peer-joined",
-              peerId: existingPeerId,
-              name: client.name,
-            });
-            controller.enqueue(`data: ${msg}\n\n`);
-          } catch {
-            // ignore
-          }
-        }
-      }
-    },
-    cancel() {
-      // Remove client from room
-      const room = rooms.get(roomId!);
-      if (room) {
-        room.delete(peerId!);
+  // Clean up old messages (older than 60 seconds)
+  await db
+    .prepare(`DELETE FROM messages WHERE created_at < ?`)
+    .bind(now - 60)
+    .run();
 
-        // Notify remaining peers
-        for (const [, client] of room) {
-          try {
-            const msg = JSON.stringify({
-              type: "peer-left",
-              peerId,
-            });
-            client.controller.enqueue(`data: ${msg}\n\n`);
-          } catch {
-            // ignore
-          }
-        }
+  // Clean up stale participants (older than 30 seconds)
+  await db
+    .prepare(`DELETE FROM participants WHERE last_seen < ?`)
+    .bind(now - 30)
+    .run();
 
-        // Clean up empty rooms
-        if (room.size === 0) {
-          rooms.delete(roomId!);
-        }
-      }
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
+  return Response.json({
+    messages: messages.results,
+    participants: participants.results,
   });
 }
 
 export async function POST(request: Request) {
   const body = await request.json();
-  const { roomId, from, to, ...message } = body;
+  const { roomId, peerId, name, type, payload, to } = body as {
+    roomId: string;
+    peerId: string;
+    name?: string;
+    type: string;
+    payload?: string;
+    to?: string;
+  };
 
-  if (!roomId || !from) {
-    return new Response("Missing roomId or from", { status: 400 });
+  if (!roomId || !peerId) {
+    return Response.json({ error: "Missing roomId or peerId" }, { status: 400 });
   }
 
-  const room = rooms.get(roomId);
-  if (!room) {
-    return new Response("Room not found", { status: 404 });
+  const { env } = await getCloudflareContext();
+  const db = (env as Record<string, unknown>).DB as D1Database;
+  const now = Math.floor(Date.now() / 1000);
+
+  // Always update participant heartbeat
+  await db
+    .prepare(
+      `INSERT INTO participants (room_id, peer_id, name, last_seen)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (room_id, peer_id)
+       DO UPDATE SET last_seen = ?, name = ?`
+    )
+    .bind(roomId, peerId, name || "Guest", now, now, name || "Guest")
+    .run();
+
+  if (type === "heartbeat") {
+    return Response.json({ ok: true });
   }
 
-  const data = JSON.stringify({ ...message, from });
+  // Insert signaling message
+  await db
+    .prepare(
+      `INSERT INTO messages (room_id, from_peer, to_peer, type, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(roomId, peerId, to || null, type, payload || "", now)
+    .run();
 
-  if (to) {
-    // Send to specific peer
-    const client = room.get(to);
-    if (client) {
-      try {
-        client.controller.enqueue(`data: ${data}\n\n`);
-      } catch {
-        room.delete(to);
-      }
-    }
-  } else {
-    // Broadcast to all except sender
-    for (const [peerId, client] of room) {
-      if (peerId !== from) {
-        try {
-          client.controller.enqueue(`data: ${data}\n\n`);
-        } catch {
-          room.delete(peerId);
-        }
-      }
-    }
-  }
-
-  return new Response("OK", { status: 200 });
+  return Response.json({ ok: true });
 }

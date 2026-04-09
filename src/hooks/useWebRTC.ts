@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { SignalingClient, type SignalMessage } from "@/lib/signaling";
+import { SignalingClient } from "@/lib/signaling";
 
 export interface Peer {
   id: string;
@@ -33,9 +33,16 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
   const signalingRef = useRef<SignalingClient | null>(null);
   const peersRef = useRef<Map<string, Peer>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
   const createPeerConnection = useCallback(
     (remotePeerId: string, remoteName: string): RTCPeerConnection => {
+      // Close existing connection if any
+      const existing = peersRef.current.get(remotePeerId);
+      if (existing) {
+        existing.connection.close();
+      }
+
       const pc = new RTCPeerConnection(ICE_SERVERS);
 
       // Add local tracks
@@ -48,11 +55,10 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
       // Handle ICE candidates
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          signalingRef.current?.send({
-            type: "ice-candidate",
-            candidate: event.candidate.toJSON(),
-            to: remotePeerId,
-          });
+          signalingRef.current?.sendIceCandidate(
+            remotePeerId,
+            event.candidate.toJSON()
+          );
         }
       };
 
@@ -62,15 +68,15 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
         if (stream) {
           setPeers((prev) => {
             const next = new Map(prev);
-            const existing = next.get(remotePeerId);
-            if (existing) {
-              next.set(remotePeerId, { ...existing, stream });
+            const peer = next.get(remotePeerId);
+            if (peer) {
+              next.set(remotePeerId, { ...peer, stream });
             }
             return next;
           });
-          const existing = peersRef.current.get(remotePeerId);
-          if (existing) {
-            existing.stream = stream;
+          const peer = peersRef.current.get(remotePeerId);
+          if (peer) {
+            peer.stream = stream;
           }
         }
       };
@@ -84,73 +90,16 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
       peersRef.current.set(remotePeerId, peer);
       setPeers(new Map(peersRef.current));
 
+      // Apply any pending ICE candidates
+      const pending = pendingCandidatesRef.current.get(remotePeerId);
+      if (pending) {
+        pending.forEach((c) => pc.addIceCandidate(new RTCIceCandidate(c)));
+        pendingCandidatesRef.current.delete(remotePeerId);
+      }
+
       return pc;
     },
     []
-  );
-
-  const handleSignalMessage = useCallback(
-    async (msg: SignalMessage) => {
-      switch (msg.type) {
-        case "peer-joined": {
-          // Create offer for new peer
-          const pc = createPeerConnection(msg.peerId, msg.name);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          signalingRef.current?.send({
-            type: "offer",
-            sdp: offer.sdp!,
-            to: msg.peerId,
-          });
-          break;
-        }
-        case "offer": {
-          const existingPeer = peersRef.current.get(msg.from);
-          const pc = existingPeer
-            ? existingPeer.connection
-            : createPeerConnection(msg.from, msg.from);
-          await pc.setRemoteDescription(
-            new RTCSessionDescription({ type: "offer", sdp: msg.sdp })
-          );
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          signalingRef.current?.send({
-            type: "answer",
-            sdp: answer.sdp!,
-            to: msg.from,
-          });
-          break;
-        }
-        case "answer": {
-          const peer = peersRef.current.get(msg.from);
-          if (peer) {
-            await peer.connection.setRemoteDescription(
-              new RTCSessionDescription({ type: "answer", sdp: msg.sdp })
-            );
-          }
-          break;
-        }
-        case "ice-candidate": {
-          const peer = peersRef.current.get(msg.from);
-          if (peer) {
-            await peer.connection.addIceCandidate(
-              new RTCIceCandidate(msg.candidate)
-            );
-          }
-          break;
-        }
-        case "peer-left": {
-          const peer = peersRef.current.get(msg.peerId);
-          if (peer) {
-            peer.connection.close();
-            peersRef.current.delete(msg.peerId);
-            setPeers(new Map(peersRef.current));
-          }
-          break;
-        }
-      }
-    },
-    [createPeerConnection]
   );
 
   // Initialize media and signaling
@@ -175,9 +124,70 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
         const signaling = new SignalingClient(roomId, peerId, userName);
         signalingRef.current = signaling;
 
-        signaling.onMessage = (msg) => handleSignalMessage(msg);
+        // When a new peer joins, create an offer
+        signaling.onPeerJoined = async (remotePeerId, remoteName) => {
+          // Only the peer with the "smaller" ID initiates the offer
+          // This prevents both peers from sending offers simultaneously
+          if (peerId < remotePeerId) {
+            const pc = createPeerConnection(remotePeerId, remoteName);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            signaling.sendOffer(remotePeerId, offer.sdp!);
+          } else {
+            // Just register the peer, wait for their offer
+            if (!peersRef.current.has(remotePeerId)) {
+              const pc = createPeerConnection(remotePeerId, remoteName);
+              void pc; // connection ready for incoming offer
+            }
+          }
+        };
+
+        signaling.onOffer = async (from, sdp) => {
+          const existingPeer = peersRef.current.get(from);
+          const pc = existingPeer
+            ? existingPeer.connection
+            : createPeerConnection(from, from);
+          await pc.setRemoteDescription(
+            new RTCSessionDescription({ type: "offer", sdp })
+          );
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          signaling.sendAnswer(from, answer.sdp!);
+        };
+
+        signaling.onAnswer = async (from, sdp) => {
+          const peer = peersRef.current.get(from);
+          if (peer) {
+            await peer.connection.setRemoteDescription(
+              new RTCSessionDescription({ type: "answer", sdp })
+            );
+          }
+        };
+
+        signaling.onIceCandidate = async (from, candidate) => {
+          const peer = peersRef.current.get(from);
+          if (peer && peer.connection.remoteDescription) {
+            await peer.connection.addIceCandidate(
+              new RTCIceCandidate(candidate)
+            );
+          } else {
+            // Queue candidate until remote description is set
+            const pending = pendingCandidatesRef.current.get(from) || [];
+            pending.push(candidate);
+            pendingCandidatesRef.current.set(from, pending);
+          }
+        };
+
+        signaling.onPeerLeft = (remotePeerId) => {
+          const peer = peersRef.current.get(remotePeerId);
+          if (peer) {
+            peer.connection.close();
+            peersRef.current.delete(remotePeerId);
+            setPeers(new Map(peersRef.current));
+          }
+        };
+
         signaling.onConnected = () => setIsConnected(true);
-        signaling.onDisconnected = () => setIsConnected(false);
 
         signaling.connect();
       } catch (err) {
@@ -193,7 +203,7 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
       peersRef.current.forEach((peer) => peer.connection.close());
       signalingRef.current?.disconnect();
     };
-  }, [roomId, peerId, userName, handleSignalMessage]);
+  }, [roomId, peerId, userName, createPeerConnection]);
 
   const toggleAudio = useCallback(() => {
     if (localStreamRef.current) {
@@ -215,14 +225,9 @@ export function useWebRTC({ roomId, userName, peerId }: UseWebRTCOptions) {
 
   const sendChatMessage = useCallback(
     (message: string) => {
-      signalingRef.current?.send({
-        type: "chat",
-        message,
-        name: userName,
-        timestamp: Date.now(),
-      });
+      signalingRef.current?.sendChat(message, Date.now());
     },
-    [userName]
+    []
   );
 
   return {
