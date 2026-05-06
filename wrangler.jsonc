@@ -13,5 +13,11 @@
       "database_name": "mango-signaling",
       "database_id": "4d9d8bc2-8658-4f17-b2b1-ef680e651589"
     }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "RECORDINGS",
+      "bucket_name": "mango-recordings"
+    }
   ]
 }

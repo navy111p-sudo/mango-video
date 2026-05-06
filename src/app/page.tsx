@@ -30,12 +30,18 @@ export default function HomePage() {
           WebRTC 기반 실시간 화상영어 솔루션. 화상 통화, 판서, 채팅, 녹화까지
           하나의 플랫폼에서 모두 제공합니다.
         </p>
-        <div className="flex gap-4 mb-16">
+        <div className="flex gap-4 mb-16 flex-wrap justify-center">
           <Link
             href="/lobby"
             className="px-8 py-3 rounded-lg bg-[var(--color-primary)] text-black font-semibold text-lg hover:bg-[var(--color-primary-light)] transition-colors"
           >
             수업 시작하기
+          </Link>
+          <Link
+            href="/recordings"
+            className="px-8 py-3 rounded-lg border-2 border-[var(--color-primary)] text-[var(--color-primary)] font-semibold text-lg hover:bg-[var(--color-primary)] hover:text-black transition-colors"
+          >
+            녹화본 복습
           </Link>
           <Link
             href="/lobby?mode=demo"

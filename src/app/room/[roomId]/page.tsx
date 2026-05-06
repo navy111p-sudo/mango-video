@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
 import VideoPlayer from "@/components/VideoPlayer";
 import ChatPanel, { type ChatMessage } from "@/components/ChatPanel";
@@ -43,16 +43,28 @@ function RoomContent() {
     sendChatMessage,
   } = useWebRTC({ roomId, userName, peerId });
 
-  const { isRecording, startRecording, stopRecording } = useRecorder();
+  const { isRecording, isUploading, startRecording, stopRecording } = useRecorder();
+  const autoRecordStarted = useRef(false);
 
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isWhiteboardOpen, setIsWhiteboardOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
 
-  // Listen for incoming chat messages via signaling
+  // Auto-start recording when local stream is available
   useEffect(() => {
-    // Chat messages arrive via the WebRTC signaling handler
-    // We handle them in the signaling client's onMessage
+    if (localStream && !autoRecordStarted.current) {
+      autoRecordStarted.current = true;
+      startRecording(localStream, {
+        roomId,
+        roomType,
+        userName,
+        sessionNum: 1,
+      });
+    }
+  }, [localStream, roomId, roomType, userName, startRecording]);
+
+  // Listen for incoming chat messages
+  useEffect(() => {
     const handler = (e: CustomEvent<ChatMessage>) => {
       setChatMessages((prev) => [...prev, e.detail]);
     };
@@ -83,13 +95,22 @@ function RoomContent() {
     if (isRecording) {
       stopRecording();
     } else if (localStream) {
-      startRecording(localStream);
+      startRecording(localStream, {
+        roomId,
+        roomType,
+        userName,
+        sessionNum: 1,
+      });
     }
-  }, [isRecording, localStream, startRecording, stopRecording]);
+  }, [isRecording, localStream, startRecording, stopRecording, roomId, roomType, userName]);
 
   const handleLeave = useCallback(() => {
-    router.push("/lobby");
-  }, [router]);
+    if (isRecording) {
+      stopRecording();
+    }
+    // Small delay to let upload start before navigating
+    setTimeout(() => router.push("/lobby"), 500);
+  }, [router, isRecording, stopRecording]);
 
   const peerList = Array.from(peers.values());
 
@@ -101,6 +122,13 @@ function RoomContent() {
 
   return (
     <div className="h-screen flex flex-col">
+      {/* Upload indicator */}
+      {isUploading && (
+        <div className="fixed top-4 right-4 z-50 px-4 py-3 rounded-lg bg-[var(--color-primary)] text-black font-medium text-sm shadow-lg">
+          녹화 업로드 중...
+        </div>
+      )}
+
       {/* Top bar */}
       <header className="flex items-center justify-between px-4 py-2 bg-[var(--color-bg-card)] border-b border-[var(--color-border)]">
         <div className="flex items-center gap-3">
@@ -114,6 +142,12 @@ function RoomContent() {
           <span className="px-2 py-0.5 rounded bg-[var(--color-bg-elevated)] text-xs text-[var(--color-text-muted)]">
             {role === "host" ? "호스트" : "참여자"}
           </span>
+          {isRecording && (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-[var(--color-danger)] text-xs text-white font-medium">
+              <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+              자동 녹화 중
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <div
@@ -144,35 +178,17 @@ function RoomContent() {
                   ? "1fr 1fr"
                   : "repeat(auto-fit, minmax(300px, 1fr))",
             }}>
-              {/* Local video */}
-              <VideoPlayer
-                stream={localStream}
-                muted
-                label={userName}
-                isLocal
-              />
-
-              {/* Remote peers */}
+              <VideoPlayer stream={localStream} muted label={userName} isLocal />
               {peerList.map((peer) => (
-                <VideoPlayer
-                  key={peer.id}
-                  stream={peer.stream}
-                  label={peer.name}
-                />
+                <VideoPlayer key={peer.id} stream={peer.stream} label={peer.name} />
               ))}
             </div>
           )}
 
-          {/* Small local video when whiteboard is open */}
           {isWhiteboardOpen && (
             <div className="flex gap-3 h-32">
               <div className="w-48">
-                <VideoPlayer
-                  stream={localStream}
-                  muted
-                  label={userName}
-                  isLocal
-                />
+                <VideoPlayer stream={localStream} muted label={userName} isLocal />
               </div>
               {peerList.map((peer) => (
                 <div key={peer.id} className="w-48">
@@ -183,7 +199,6 @@ function RoomContent() {
           )}
         </div>
 
-        {/* Chat panel */}
         {isChatOpen && (
           <div className="w-80 border-l border-[var(--color-border)] p-3">
             <ChatPanel messages={chatMessages} onSend={handleSendChat} />
@@ -191,7 +206,6 @@ function RoomContent() {
         )}
       </div>
 
-      {/* Control bar */}
       <ControlBar
         isAudioEnabled={isAudioEnabled}
         isVideoEnabled={isVideoEnabled}
